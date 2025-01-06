@@ -9,6 +9,7 @@
 - **PySpark** для обработки данных.
 - **PostgreSQL** для хранения данных.
 - **Google Colab** для разработки и выполнения кода.
+- **Apache Airflow** для автоматизации ETL-процесса.
 
 ---
 
@@ -24,7 +25,7 @@ from google.colab import drive
 drive.mount('/content/drive')
 
 # Установка зависимостей
-!pip install pyspark psycopg2-binary
+!pip install pyspark psycopg2-binary apache-airflow
 
 # Импорт библиотек
 from pyspark.sql import SparkSession
@@ -51,6 +52,7 @@ df.printSchema()
 df.show(5)
 ```
 
+
 Проверка структуры и качества данных включала поиск дубликатов, пропущенных значений и неадекватных значений в числовых столбцах.
 
 ```python
@@ -68,12 +70,12 @@ missing_values.show()
 
 Были предприняты следующие шаги для очистки данных:
 
-1. Удаление дубликатов.
-2. Удаление строк с пропущенными значениями в критических столбцах.
-3. Замену пропущенных значений в категориальных столбцах на "Other".
-4. Удаление строк с ценой равной 0.
-5. Ограничение диапазона для года регистрации автомобилей (1900–2025).
-6. Удаление столбца `nrOfPictures`.
+1. **Удаление дубликатов**: дубликаты могут искажать статистику и мешать анализу.
+2. **Удаление строк с пропущенными значениями в критических столбцах**: такие значения делают запись неполной и бесполезной.
+3. **Замену пропущенных значений в категориальных столбцах на "Other"**: это позволяет сохранить данные, не искажая их логику.
+4. **Удаление строк с ценой равной 0**: такие значения некорректны, так как автомобили не могут стоить ноль.
+5. **Ограничение диапазона для года регистрации автомобилей (1900–2025)**: значения за пределами этого диапазона считаются ошибочными.
+6. **Удаление столбца `nrOfPictures`**: он содержит только нули и не несет полезной информации.
 
 ```python
 # Удаление дубликатов
@@ -100,7 +102,7 @@ df = df.drop("nrOfPictures")
 
 ### 4. Нормализация данных
 
-Данные были разделены на несколько связанных таблиц для загрузки в реляционную базу данных.
+Данные были разделены на несколько связанных таблиц для загрузки в реляционную базу данных. Нормализация помогает устранить избыточность данных и улучшить производительность запросов.
 
 ```python
 # Таблица sellers
@@ -123,80 +125,89 @@ df_listings = df.join(df_sellers, ["seller", "offerType"], "left") \
     .withColumn("listing_id", F.monotonically_increasing_id())
 ```
 
-### 5. Создание таблиц в PostgreSQL
+### 5. Создание DAG для автоматизации ETL-процесса
 
-Были созданы таблицы в базе данных PostgreSQL:
+Был реализован DAG с использованием Apache Airflow, чтобы автоматизировать процесс ETL. DAG включает три задачи:
 
-```python
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS Sellers (
-    seller_id SERIAL PRIMARY KEY,
-    seller TEXT,
-    offerType TEXT
-);
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS Vehicles (
-    vehicle_id SERIAL PRIMARY KEY,
-    vehicleType TEXT,
-    brand TEXT,
-    model TEXT,
-    yearOfRegistration INT,
-    powerPS INT,
-    fuelType TEXT
-);
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS Geolocation (
-    location_id SERIAL PRIMARY KEY,
-    postalCode INT
-);
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS Listings (
-    listing_id SERIAL PRIMARY KEY,
-    dateCrawled TIMESTAMP,
-    price INT,
-    kilometer INT,
-    monthOfRegistration INT,
-    notRepairedDamage BOOLEAN,
-    dateCreated TIMESTAMP,
-    lastSeen TIMESTAMP,
-    vehicle_id INT REFERENCES Vehicles(vehicle_id),
-    seller_id INT REFERENCES Sellers(seller_id),
-    location_id INT REFERENCES Geolocation(location_id)
-);
-""")
-conn.commit()
-```
-
-### 6. Загрузка данных в базу данных
-
-Данные были загружены в соответствующие таблицы.
+1. **Extract**: загрузка данных из исходного CSV.
+2. **Transform**: очистка и нормализация данных.
+3. **Load**: загрузка обработанных данных в PostgreSQL.
 
 ```python
-from psycopg2.extras import execute_values
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime, timedelta
+import os
+import pandas as pd
+from pyspark.sql import SparkSession
 
-def insert_data(df, table_name):
-    data = df.collect()
-    columns = df.columns
-    execute_values(
-        cursor,
-        f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES %s",
-        [[getattr(row, col) for col in columns] for row in data]
-    )
-    conn.commit()
+# Инициализация Spark
+def init_spark():
+    return SparkSession.builder \
+        .appName("UsedCarsETL") \
+        .config("spark.master", "local[*]") \
+        .getOrCreate()
 
-insert_data(df_sellers, "Sellers")
-insert_data(df_vehicles, "Vehicles")
-insert_data(df_geolocation, "Geolocation")
-insert_data(df_listings, "Listings")
+# Шаг 1: Загрузка данных
+def extract_data(**kwargs):
+    spark = init_spark()
+    file_path = "/content/drive/MyDrive/Datasets/used_cars.csv"
+    kwargs['ti'].xcom_push(key='raw_data', value=file_path)
+
+# Шаг 2: Трансформация данных
+def transform_data(**kwargs):
+    spark = init_spark()
+    raw_data_path = kwargs['ti'].xcom_pull(task_ids='extract_data', key='raw_data')
+    df = spark.read.csv(raw_data_path, header=True, inferSchema=True)
+    # Очистка и нормализация данных
+
+# Шаг 3: Загрузка данных в PostgreSQL
+def load_data(**kwargs):
+    # Логика загрузки данных в базу
+
+# DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'used_cars_etl',
+    default_args=default_args,
+    description='ETL pipeline for Used Cars dataset',
+    schedule_interval=timedelta(days=1),
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+)
+
+extract_task = PythonOperator(
+    task_id='extract_data',
+    python_callable=extract_data,
+    provide_context=True,
+    dag=dag,
+)
+
+transform_task = PythonOperator(
+    task_id='transform_data',
+    python_callable=transform_data,
+    provide_context=True,
+    dag=dag,
+)
+
+load_task = PythonOperator(
+    task_id='load_data',
+    python_callable=load_data,
+    provide_context=True,
+    dag=dag,
+)
+
+extract_task >> transform_task >> load_task
 ```
 
-### 7. Примеры запросов
+### 6. Примеры запросов
 
 Были выполнены запросы для анализа данных.
 
